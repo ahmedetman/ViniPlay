@@ -3,7 +3,7 @@
 
 // Load environment variables from .env file
 require('dotenv').config();
-
+const zlib = require('zlib');
 const express = require('express');
 const { spawn, exec } = require('child_process');
 const http = require('http');
@@ -457,43 +457,91 @@ function saveSettings(settings) {
     }
 }
 
-function fetchUrlContent(url, options = {}) { // <-- MODIFIED
-    return new Promise((resolve, reject) => {
-        const protocol = url.startsWith('https') ? https : http;
-        const TIMEOUT_DURATION = 60000;
-        console.log(`[FETCH] Attempting to fetch URL content: ${url} (Timeout: ${TIMEOUT_DURATION/1000}s)`);
+function fetchUrlContent(inputUrl, {
+  timeout = 60000,
+  headers = {},
+  maxRedirects = 5,
+  retryOnceWithAltUA = true
+} = {}) {
+  const altUA = 'Lavf/59.27.100'; // FFmpeg UA (fallback)
+  const defaultUA = 'VLC/3.0.20 LibVLC/3.0.20';
 
-        const request = protocol.get(url, { timeout: TIMEOUT_DURATION, ...options }, (res) => { // <-- MODIFIED
-            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                console.log(`[FETCH] Redirecting to: ${res.headers.location}`);
-                request.abort(); 
-                return fetchUrlContent(new URL(res.headers.location, url).href, options).then(resolve, reject); // <-- MODIFIED
-            }
-            if (res.statusCode !== 200) {
-                console.error(`[FETCH] Failed to fetch ${url}: Status Code ${res.statusCode}`);
-                return reject(new Error(`Failed to fetch: Status Code ${res.statusCode}`));
-            }
-            let data = '';
-            res.setEncoding('utf8');
-            res.on('data', (chunk) => { data += chunk; });
-            res.on('end', () => {
-                console.log(`[FETCH] Successfully fetched content from: ${url}`);
-                resolve(data);
-            });
-        });
+  const doFetch = (urlStr, redirects = 0, triedAlt = false) => new Promise((resolve, reject) => {
+    let u;
+    try { u = new URL(urlStr); } catch (e) { return reject(new Error(`Invalid URL: ${urlStr}`)); }
+    const mod = (u.protocol === 'https:') ? https : http;
 
-        request.on('timeout', () => {
-            request.destroy();
-            const timeoutError = new Error(`Request to ${url} timed out after ${TIMEOUT_DURATION / 1000} seconds.`);
-            console.error(`[FETCH] ${timeoutError.message}`);
-            reject(timeoutError);
-        });
+    const req = mod.request(urlStr, {
+      method: 'GET',
+      timeout, // socket idle timeout; we also add a total timer below
+      headers: {
+        'User-Agent': headers['User-Agent'] || defaultUA,
+        'Accept': 'text/plain,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        ...headers
+      }
+      // If you have self-signed TLS internally, you can temporarily add:
+      // , rejectUnauthorized: false
+    }, (res) => {
+      // Redirects
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        if (redirects >= maxRedirects) { res.resume(); return reject(new Error('Too many redirects')); }
+        const next = new URL(res.headers.location, urlStr).href;
+        res.resume();
+        return resolve(doFetch(next, redirects + 1, triedAlt));
+      }
 
-        request.on('error', (err) => {
-            console.error(`[FETCH] Network error fetching ${url}: ${err.message}`);
-            reject(err);
+      // Non-200: read body (often HTML 404 from CDN) and optionally retry with alt UA once
+      if (res.statusCode !== 200) {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', c => body += c);
+        res.on('end', async () => {
+          const msg = `HTTP ${res.statusCode} for ${urlStr}; body: ${body.slice(0,200)}`;
+          // Retry once with FFmpeg UA for UA-gated providers
+          if (retryOnceWithAltUA && !triedAlt) {
+            try {
+              const out = await doFetch(urlStr, redirects, true, { ...headers, 'User-Agent': altUA });
+              return resolve(out);
+            } catch (_) { /* fall through to reject below */ }
+          }
+          reject(new Error(msg));
         });
+        return;
+      }
+
+      // Decompression
+      let stream = res;
+      const enc = (res.headers['content-encoding'] || '').toLowerCase();
+      try {
+        if (enc.includes('br')) stream = res.pipe(zlib.createBrotliDecompress());
+        else if (enc.includes('gzip')) stream = res.pipe(zlib.createGunzip());
+        else if (enc.includes('deflate')) stream = res.pipe(zlib.createInflate());
+      } catch (e) {
+        res.resume();
+        return reject(new Error(`Decompression failed: ${e.message}`));
+      }
+
+      let data = '';
+      stream.setEncoding('utf8');
+      stream.on('data', chunk => data += chunk);
+      stream.on('end', () => resolve(data));
+      stream.on('error', reject);
     });
+
+    // Total timer (covers DNS/connect/TLS), separate from socket idle timeout
+    const totalTimer = setTimeout(() => {
+      req.destroy(new Error(`Request timed out after ${timeout}ms`));
+    }, timeout);
+
+    req.on('timeout', () => req.destroy(new Error(`Socket timeout after ${timeout}ms`)));
+    req.on('error', (err) => { clearTimeout(totalTimer); reject(err); });
+    req.on('close', () => clearTimeout(totalTimer));
+    req.end();
+  });
+
+  return doFetch(inputUrl);
 }
 
 
@@ -533,7 +581,9 @@ async function processAndMergeSources(req) { // <-- MODIFIED
         console.log('[PROCESS] No active M3U sources found.');
         sendProcessingStatus(req, 'No active M3U sources found.', 'info'); // <-- NEW
     }
-
+    const activeUa =
+      (settings.userAgents || []).find(u => u.id === settings.activeUserAgentId)?.value
+      || 'VLC/3.0.20 LibVLC/3.0.20';
     for (const source of activeM3uSources) {
         console.log(`[M3U] Processing source: "${source.name}" (ID: ${source.id}, Type: ${source.type}, Path: ${source.path})`);
         sendProcessingStatus(req, `Processing M3U source: "${source.name}"...`, 'info'); // <-- NEW
@@ -555,7 +605,9 @@ async function processAndMergeSources(req) { // <-- MODIFIED
                 }
             } else if (source.type === 'url') {
                 sendProcessingStatus(req, ` -> Fetching content from URL...`, 'info'); // <-- NEW
-                content = await fetchUrlContent(source.path);
+                content = await fetchUrlContent(source.path, {
+                  headers: { 'User-Agent': activeUa }
+                });
                 sendProcessingStatus(req, ` -> Successfully fetched M3U content.`, 'info'); // <-- NEW
             } else if (source.type === 'xc') {
                 if (!source.xc_data) {
@@ -569,7 +621,7 @@ async function processAndMergeSources(req) { // <-- MODIFIED
                 }
 
                 const fetchOptions = {
-                    headers: { 'User-Agent': 'VLC/3.0.20 (Linux; x86_64)' }
+                    headers: { 'User-Agent': activeUa }
                 };
                 const m3uUrl = `${server}/get.php?username=${username}&password=${password}&type=m3u_plus&output=ts`;
                 console.log(`[M3U] Constructed XC URL for "${source.name}": ${m3uUrl}`);
@@ -2949,17 +3001,21 @@ app.get('/api/events', requireAuth, (req, res) => {
 });
 
 app.post('/api/validate-url', requireAuth, async (req, res) => {
-    const { url } = req.body;
-    if (!url) {
-        return res.status(400).json({ error: 'URL is required.' });
-    }
-    console.log(`[VALIDATE_URL] Testing URL: ${url}`);
-    try {
-        await fetchUrlContent(url);
-        res.json({ success: true, message: 'URL is reachable and returned a successful response.' });
-    } catch (error) {
-        res.status(400).json({ success: false, error: `URL is not reachable. Error: ${error.message}` });
-    }
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ error: 'URL is required.' });
+
+  const settings = getSettings();
+  const activeUa =
+    (settings.userAgents || []).find(u => u.id === settings.activeUserAgentId)?.value
+    || 'VLC/3.0.20 LibVLC/3.0.20';
+
+  console.log(`[VALIDATE_URL] Testing URL with UA: ${activeUa} -> ${url}`);
+  try {
+    await fetchUrlContent(url, { headers: { 'User-Agent': activeUa } });
+    res.json({ success: true, message: 'URL is reachable and returned a successful response.' });
+  } catch (error) {
+    res.status(400).json({ success: false, error: `URL is not reachable. Error: ${error.message}` });
+  }
 });
 
 // --- NEW: Hardware Info Endpoint ---
